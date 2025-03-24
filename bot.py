@@ -22,7 +22,7 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 SUBSCRIBERS_FILE = "subscribers.json"
-
+HISTORY_FILE = "history.json"
 def load_subscribers():
     try:
         if os.path.exists(SUBSCRIBERS_FILE):
@@ -40,12 +40,50 @@ def save_subscribers(subscribers):
     except Exception as e:
         logging.error(f"Ошибка сохранения подписчиков: {e}")
 
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r") as file:
+                return json.load(file)
+        return {}
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        logging.error(f"Ошибка загрузки истории: {e}")
+        return {}
+
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, "w") as file:
+            json.dump(history, file, indent=4)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения истории: {e}")
+
+def add_to_history(user_id, data_type, value):
+    history = load_history()
+    user_id_str = str(user_id)
+    
+    if user_id_str not in history:
+        history[user_id_str] = {"email": [], "ip": [], "phone": []}
+    
+    if value not in history[user_id_str][data_type]:
+        history[user_id_str][data_type].append(value)
+    
+    save_history(history)
+
 # Устанавливаем команды, доступные в боте
 async def set_bot_commands():
     commands = [
-        BotCommand(command="/start", description="Начать работу с ботом")
+        BotCommand(command="/start", description="Начать работу с ботом"),
+        BotCommand(command="/status", description="Показать статус подписки и историю")
     ]
     await bot.set_my_commands(commands)
+    logging.info("Установлены команды /start и /status")
+
+    # Логируем информацию в методе main
+async def main():
+    logging.info("Запуск бота...")
+    await set_bot_commands()
+    logging.info("Бот зарегистрировал команды.")
+    await dp.start_polling(bot)
 
 # Главная кнопка старт
 start_keyboard = ReplyKeyboardMarkup(
@@ -102,6 +140,31 @@ async def unsubscribe(message: Message):
         logging.error(f"Ошибка при отписке: {e}")
         await message.answer("❌ Произошла ошибка при отписке. Попробуйте позже.")
 
+@dp.message(Command("status"))
+async def status(message: Message):
+    logging.info("Команда /status получена")
+    subscribers = load_subscribers()
+    history = load_history()
+    user_id_str = str(message.from_user.id)
+    
+    is_subscribed = "✅ Подписаны" if message.from_user.id in subscribers else "❌ Не подписаны"
+    
+    # Получаем историю для конкретного пользователя
+    user_history = history.get(user_id_str, {"email": [], "ip": [], "phone": []})
+    
+    # Формируем списки для вывода
+    email_list = "\n".join(user_history["email"]) if user_history["email"] else "Нет данных"
+    ip_list = "\n".join(user_history["ip"]) if user_history["ip"] else "Нет данных"
+    phone_list = "\n".join(user_history["phone"]) if user_history["phone"] else "Нет данных"
+    
+    response = f"📊 Ваш статус:\n🔔 Подписка: {is_subscribed}\n\n📧 История email:\n{email_list}\n\n🌐 История IP:\n{ip_list}\n\n📱 История телефонов:\n{phone_list}"
+    
+    await message.answer(response)
+
+
+@dp.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer("Команды доступны: /start, /status")
 
 async def send_notifications():
     while True:
@@ -163,19 +226,32 @@ async def send_2fa_info(message: Message):
         "- 🦸‍♂️ [VKontakte](https://vk.com/settings) - Инструкции для ВКонтакте"
     )
 
-# Проверка email на утечку данных
+# Проверка email на утечку данных через LeakCheck
 async def check_data_breach(email):
     try:
         url = f"https://leakcheck.io/api?key={LEAKCHECK_API_KEY}&check={email}"
+        logging.info(f"Запрос к LeakCheck для email: {email}")  # Логируем запрос
         response = requests.get(url)
-        data = response.json()
-
-        if data.get("success") and data.get("found"):
-            return True  # Email найден в базе утечек
-        return False  # Email не найден
+        
+        if response.status_code == 403:
+            logging.error(f"Ошибка 403: Доступ к API LeakCheck запрещен. Проверь API-ключ.")
+            return False
+        if response.status_code == 200:
+            data = response.json()
+            logging.info(f"Ответ от LeakCheck: {data}")  # Логируем ответ от сервера
+            
+            if data.get("success") and data.get("found"):
+                add_to_history(user_id=email, data_type="email", value=email)
+                return True  # Email найден в базе утечек
+            else:
+                return False  # Email не найден
+        else:
+            logging.error(f"Ошибка при запросе к LeakCheck: {response.status_code}")
+            return False
     except Exception as e:
         logging.error(f"Ошибка при проверке утечки данных: {e}")
         return False
+
 
 # Проверка телефона на утечку данных
 async def check_phone_breach(phone):
@@ -185,6 +261,7 @@ async def check_phone_breach(phone):
         data = response.json()
 
         if data.get("success") and data.get("found"):
+            add_to_history(user_id=phone, data_type="phone", value=phone)
             return True  # Телефон найден в базе утечек
         return False  # Телефон не найден
     except Exception as e:
@@ -226,10 +303,13 @@ async def check_ip_reputation(ip_address):
         if data.get("success", False):
             risk = data.get("fraud_score", 0)
             if risk > 80:
+                add_to_history(user_id=ip_address, data_type="ip", value=ip_address)
                 return f"❌ IP-адрес {ip_address} имеет высокий риск: {risk}/100."
             elif risk > 50:
+                add_to_history(user_id=ip_address, data_type="ip", value=ip_address)
                 return f"⚠️ IP-адрес {ip_address} имеет средний риск: {risk}/100."
             else:
+                add_to_history(user_id=ip_address, data_type="ip", value=ip_address)
                 return f"✅ IP-адрес {ip_address} безопасен: {risk}/100."
         else:
             return "❌ Ошибка при проверке IP-адреса."
